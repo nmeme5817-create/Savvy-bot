@@ -1,0 +1,847 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Install SDK bits
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-35" "build-tools;35.0.0" || true
+
+      - name: Write project
+        run: |
+          mkdir -p app/src/main/java/live/savvybot
+          mkdir -p app/src/main/res/xml app/src/main/res/values
+          mkdir -p app/src/main/assets
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "SavvyBot"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "live.savvybot"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "live.savvybot"
+                  minSdk = 30
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application
+                  android:allowBackup="true"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".CaptureService" android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+                  <service android:name=".SavvyA11yService" android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">SavvyBot</string>
+              <string name="a11y_desc">Reads the Savvy board so SavvyBot can suggest answers.</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:notificationTimeout="100"
+              android:description="@string/a11y_desc" />
+          EOF
+
+          cat > app/src/main/java/live/savvybot/SolverEngine.kt <<'EOF'
+          package live.savvybot
+
+          class SolverEngine(private val dictionary: List<String>) {
+
+              data class Row(val letters: String, val marks: String)
+              data class Result(val pool: List<String>, val ranked: List<String>, val solved: Boolean)
+
+              private class C(
+                  val greens: Array<Char?>,
+                  val ypos: Set<String>,
+                  val min: MutableMap<Char, Int>,
+                  val max: MutableMap<Char, Int>
+              )
+
+              fun solve(committed: List<Row>, n: Int, solveMode: Boolean): Result {
+                  val c = constraints(committed, n)
+                  val used = HashSet<Char>()
+                  committed.forEach { r -> r.letters.forEach { used.add(it) } }
+                  val pool = dictionary.filter { w -> w.length == n && fits(w, c) }
+                  if (pool.isEmpty()) return Result(pool, emptyList(), false)
+                  return Result(pool, rank(pool, used, n, solveMode), pool.size == 1)
+              }
+
+              private fun constraints(rows: List<Row>, n: Int): C {
+                  val greens = arrayOfNulls<Char>(n)
+                  val ypos = HashSet<String>()
+                  val min = HashMap<Char, Int>()
+                  val max = HashMap<Char, Int>()
+                  for (r in rows) {
+                      if (r.letters.length != n || r.marks.length != n) continue
+                      val nonGray = HashMap<Char, Int>()
+                      for (i in 0 until n) if (r.marks[i] != 'x') {
+                          val ch = r.letters[i]
+                          nonGray[ch] = (nonGray[ch] ?: 0) + 1
+                      }
+                      for (i in 0 until n) {
+                          val ch = r.letters[i]
+                          when (r.marks[i]) {
+                              'g' -> { greens[i] = ch; min[ch] = 1 }
+                              'y' -> { ypos.add("" + ch + i); min[ch] = 1 }
+                          }
+                      }
+                      for (i in 0 until n) if (r.marks[i] == 'x') {
+                          val ch = r.letters[i]
+                          max[ch] = minOf(max[ch] ?: 99, nonGray[ch] ?: 0)
+                      }
+                  }
+                  for ((ch, lo) in min) {
+                      val hi = max[ch] ?: continue
+                      if (hi < lo) max[ch] = lo
+                  }
+                  return C(greens, ypos, min, max)
+              }
+
+              private fun fits(w: String, c: C): Boolean {
+                  for (i in w.indices) {
+                      val g = c.greens[i]
+                      if (g != null && w[i] != g) return false
+                  }
+                  for (k in c.ypos) if (w[k.last() - '0'] == k.first()) return false
+                  val cnt = HashMap<Char, Int>()
+                  for (ch in w) cnt[ch] = (cnt[ch] ?: 0) + 1
+                  for ((ch, lo) in c.min) if ((cnt[ch] ?: 0) < lo) return false
+                  for ((ch, hi) in c.max) if ((cnt[ch] ?: 0) > hi) return false
+                  return true
+              }
+
+              private fun rank(pool: List<String>, used: Set<Char>, n: Int, solveMode: Boolean): List<String> {
+                  val posFreq = Array(n) { HashMap<Char, Int>() }
+                  val letterFreq = HashMap<Char, Int>()
+                  for (w in pool) for (i in 0 until n) {
+                      val ch = w[i]
+                      posFreq[i][ch] = (posFreq[i][ch] ?: 0) + 1
+                      letterFreq[ch] = (letterFreq[ch] ?: 0) + 1
+                  }
+                  val tot = pool.size.toFloat()
+                  val wg = if (solveMode) 0.55f else 1.0f
+                  val wn = if (solveMode) 1.0f else 0.42f
+                  return pool.sortedByDescending { w ->
+                      var s = 0f
+                      for (i in 0 until n) s += wg * ((posFreq[i][w[i]] ?: 0) / tot)
+                      val seen = HashSet<Char>()
+                      for (ch in w) {
+                          if (!seen.add(ch)) continue
+                          if (ch !in used) s += wn * ((letterFreq[ch] ?: 0) / tot)
+                      }
+                      s
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/live/savvybot/WordRepo.kt <<'EOF'
+          package live.savvybot
+
+          import android.content.Context
+
+          object WordRepo {
+              private const val FALLBACK =
+                  "crane slate audio raise arise irate orate stare trace cater react later alert alter " +
+                  "scale tales stale least steal lease adept adopt dater rated tared trade tread bares " +
+                  "bears saber baser beard bread break brace braid brain brake brand brass brave brawl " +
+                  "brawn cabin cable cache cadet cagey camel cameo canal candy canoe caper carat cards " +
+                  "cared cargo carol carry carve cased cases caste catch cause caved caves cease cedar " +
+                  "cello chafe chain chair chalk champ chant chaos charm chart chase chasm cheap cheat " +
+                  "check cheek cheer chess chest chick chief child chime china chirp chock choir choke " +
+                  "chord chore chose chuck chunk churn chute cider cigar cinch civic civil claim clamp " +
+                  "clang clank clash clasp class clean clear cleat clerk click cliff climb cling clink " +
+                  "cloak clock clone close cloth cloud clout clove clown cluck clump clung coach coast " +
+                  "cobra cocoa colon color comet comfy comic comma conch condo coral corny couch cough " +
+                  "could count coupe court cover covet cower crack craft cramp crane crank crash crass " +
+                  "crate crave crawl craze crazy creak cream credo creed creek creep crepe crept crest " +
+                  "cried crier crime crimp crisp croak crock crone crony crook cross crowd crown crude " +
+                  "cruel crumb crush crust crypt cubed cubes cubic cumin curbs curds cured curio curly " +
+                  "curry curse curve curvy cycle dairy daisy dance dandy dared dares darts dated dates " +
+                  "datum dealt deans dears death debit debug debut decal decay decor decoy defer deign " +
+                  "deity delay delta delve demon denim dense depot depth derby desks deter detox devil " +
+                  "diary dicey digit dimly diner dingy dirge dirty disco ditch diver dizzy docks dodge " +
+                  "dodgy doing dolly donor donut doubt dough dowdy dowel downs dowry dozen draft drain " +
+                  "drake drama drank drape drawl drawn dread dream dregs dress dried drier drift drill " +
+                  "drink drive droll drone drool droop drops dross drove drown druid drunk dryer dryly " +
+                  "ducky dummy dumpy dunce dunes dusky dusty dutch duvet dwarf dwell dwelt dying eager " +
+                  "eagle early earth easel eaten eater ebony eclat edict eerie eight eject elate elbow " +
+                  "elder elect elegy elfin elide elite elope elude email embed ember emcee empty enact " +
+                  "ended endow enemy enjoy ennui ensue enter entry envoy epoch epoxy equal equip erase " +
+                  "erect erode error erupt essay ester ether ethic ethos evade event every evict evoke " +
+                  "exact exalt excel exert exile exist expel extol extra exult fable faced facet faint " +
+                  "fairy faith false famed fancy fangs farce fatal fated fault fauna favor feast feats " +
+                  "fecal feign fella felon femur fence feral ferry fetal fetch fetid fever fewer fiber " +
+                  "field fiend fiery fifth fifty fight filch filed filet filly filmy filth final finch " +
+                  "finer first fishy fists fixed fixer fizzy flail flair flake flaky flame flank flare " +
+                  "flash flask fleck fleet flesh flick flier fling flint flirt float flock flood floor " +
+                  "flora floss flour flout flown fluff fluid fluke flung flunk flush flute foamy focal " +
+                  "focus foggy foist folio folly foray force forge forgo forte forth forty forum found " +
+                  "foyer frail frame frank fraud freak freed freer fresh friar fried frill frisk frock " +
+                  "frond front frost froth frown froze fruit fudge fugue fully fungi funky funny furor " +
+                  "furry fussy fuzzy gable gaily gamut gassy gaudy gauge gaunt gauze gavel gawky gecko " +
+                  "geeky geese genie genre ghost ghoul giant giddy girth given giver glade gland glare " +
+                  "glass glaze gleam glean glide glint gloat globe gloom glory gloss glove glued gnome " +
+                  "godly going golem goofy goose gorge gouge gourd grace grade graft grail grain grand " +
+                  "grant grape graph grasp grass grate grave gravy graze great greed green greet grief " +
+                  "grill grime grimy grind gripe groan groin groom grope gross group grout grove growl " +
+                  "grown gruel gruff grunt guard guava guess guest guide guild guile guilt guise gulch " +
+                  "gully gumbo gummy guppy gusto gusty habit hairy halve handy hardy harem harpy harsh " +
+                  "haste hasty hatch hater haunt haven havoc hazel heady heard heart heath heave heavy " +
+                  "hedge hefty heist hello hence herbs heron hertz hilly hinge hippo hitch hoard hobby " +
+                  "hoist holly homer honey honor horde horny horse hotel hound house hover howdy human " +
+                  "humid humor hunch hurry husky hutch hydro hyena hyper icily icing ideal idiom idiot " +
+                  "idler idyll igloo image imbue impel imply inane inbox incur index inept inert infer " +
+                  "ingot inlay inlet inner input inter intro irate irony islet issue itchy ivory jaunt " +
+                  "jazzy jelly jerky jetty jewel jiffy joint joist joker jolly joust judge juice juicy " +
+                  "jumbo jumpy junta juror karma kayak kebab khaki kinky kiosk kitty knack knave knead " +
+                  "kneel knelt knife knock knoll known koala label labor laden ladle lager lance lanky " +
+                  "lapel lapse large larva laser lasso latch later lathe latte laugh layer leach leafy " +
+                  "leaky leant leaps learn lease leash least leave ledge leech leery lefty legal legit " +
+                  "lemon lemur level lever libel light liken lilac limbo limit linen liner lingo lipid " +
+                  "liter lithe liver livid llama loamy loath lobby local locus lodge lofty logic loner " +
+                  "loopy loose lorry loser louse lousy lover lower lowly loyal lucid lucky lumpy lunar " +
+                  "lunch lunge lurch lurid lusty lying lymph lyric macaw macho macro madam madly mafia " +
+                  "magic magma maize major maker mambo mamma mango mangy mania manic manly manor maple " +
+                  "march marry marsh mason match mauve maxim maybe mayor mealy meaty medal media medic " +
+                  "melon mercy merge merit merry metal meter metro micro midge midst might milky mimic " +
+                  "mince miner minor minty minus mirth misty mixed mixer modal model modem mogul moist " +
+                  "molar moldy money month moody moose moral moron morph mossy motel motif motor motto " +
+                  "mound mount mourn mouse mouth mover movie mower mucky mucus muddy mulch mummy munch " +
+                  "mural murky mushy music musky musty muted myrrh nadir naive nanny nasal nasty naval " +
+                  "navel needy neigh nerdy nerve never newer newly newsy nicer niche niece night ninja " +
+                  "ninth noble nobly noise noisy nomad north nosey notch noted novel nudge nurse nutty " +
+                  "nylon nymph oaken oasis obese occur ocean octal octet odder oddly offal offer often " +
+                  "oiled olden older olive omega onion onset opera opine opium optic orbit order organ " +
+                  "other otter ought ounce outdo outer outgo ovary overt ovine ovoid owing owner oxide " +
+                  "ozone paddy pagan paint paler palsy panel panic pansy papal paper parer parka parry " +
+                  "parse party pasta paste pasty patch patio patsy patty pause paved paver payee payer " +
+                  "pearl pecan pedal penny perch peril perky pesky pesto petal petty phase phone photo " +
+                  "piano picky piece piety piggy pilot pinch piney pinky pinto piper pique pitch pithy " +
+                  "pivot pixel pixie pizza place plaid plain plait plane plank plant plate plaza plead " +
+                  "pleat plied plier pluck plumb plume plump plunk plush poems point poise poker polar " +
+                  "polka polyp pooch poppy porch poser posit pouch pound pouty power prank prawn preen " +
+                  "press price prick pride pried prime primo print prior prism privy prize probe prone " +
+                  "prong proof props prose proud prove prowl proxy prude prune psalm pubic pudgy puffy " +
+                  "pulpy pulse punch pupil puppy puree purer purge purse pushy putty pygmy quack quail " +
+                  "quake qualm quark quart quash quasi queen queer quell query quest queue quick quiet " +
+                  "quill quilt quirk quite quota quoth rabbi rabid racer radar radio rafts rainy raise " +
+                  "rally ramen ranch randy range rapid raspy ratio ratty raven rayon reach react ready " +
+                  "realm rearm rebar rebel rebus rebut recap recur recut reedy refer refit regal reign " +
+                  "relax relay relic remit renal renew repay repel reply rerun reset resin retch retro " +
+                  "retry reuse revel revue rhino rhyme rider ridge rifle right rigid rigor rinse ripen " +
+                  "risen riser risky rival river rivet roach roast robin robot rocky rodeo rogue roomy " +
+                  "roost rotor rouge rough round rouse route rover rowdy royal ruddy ruder rugby ruler " +
+                  "rumba rumor rupee rural rusty saber sabre sadly safer saint salad sally salon salsa " +
+                  "salty salve salvo sandy saner sappy sassy satin satyr sauce saucy sauna saute savor " +
+                  "savvy scald scale scalp scaly scamp scant scare scarf scary scene scent scion scoff " +
+                  "scold scone scoop scope score scorn scour scout scowl scram scrap scree screw scrub " +
+                  "scrum scuba sedan seedy segue seize semen sense sepia serum serve setup seven sever " +
+                  "sewer shack shade shady shaft shake shaky shale shall shame shank shape shard share " +
+                  "shark sharp shave shawl sheaf shear sheen sheep sheer sheet sheik shelf shell shied " +
+                  "shift shine shiny shire shirk shirt shoal shock shone shook shoot shore shorn short " +
+                  "shout shove shown showy shrew shrub shrug shuck shunt shush shyly siege sieve sight " +
+                  "sigma silky silly since sinew singe siren sissy sixth sixty skate skier skiff skill " +
+                  "skimp skirt skulk skull skunk slack slain slang slant slash slate sleek sleep sleet " +
+                  "slept slice slick slide slime slimy sling slink slope slosh sloth slump slung slunk " +
+                  "slurp slush slyly smack small smart smash smear smell smelt smile smirk smite smock " +
+                  "smoke smoky smote snack snail snake snaky snare snarl sneak snide sniff snipe snoop " +
+                  "snore snort snout snowy snuck snuff soapy sober soggy solar solid solve sonar sonic " +
+                  "sooth sooty sorry sound south sower space spade spank spare spark spasm spawn speak " +
+                  "spear speck speed spell spend spent sperm spice spicy spied spiel spike spiky spill " +
+                  "spilt spine spiny spire spite splat split spoil spoke spoof spook spool spoon spore " +
+                  "sport spout spray spree sprig spurn spurt squad squat squib stack staff stage staid " +
+                  "stain stair stake stale stalk stall stamp stand stank stare stark start stash state " +
+                  "stave steak steal steam steed steel steep steer stein stern stick stiff still stilt " +
+                  "sting stink stint stock stoic stoke stole stomp stone stony stood stool stoop store " +
+                  "stork storm story stout stove strap straw stray strip strut stuck study stuff stump " +
+                  "stung stunk stunt style suave sugar suing suite sulky sully sumac sunny super surer " +
+                  "surge surly sushi swamp swarm swear sweat sweep sweet swell swept swift swine swing " +
+                  "swipe swirl swish swoon swoop sword swore sworn swung synod syrup table taboo tacit " +
+                  "tacky taffy taint taken taker tally talon tamer tango tangy taper tapir tardy tarot " +
+                  "taste tasty taunt tawny teach tease teddy teeth tempo tenet tenor tense tenth tepid " +
+                  "terse testy thank theft their theme there these thick thief thigh thing think third " +
+                  "thong thorn those three threw throb throw thumb thump thyme tiara tibia tidal tiger " +
+                  "tight timer timid tipsy titan tithe title toast today token tonal tonic tooth topaz " +
+                  "topic torch torso total totem touch tough towel tower toxic toxin trace track tract " +
+                  "trade trail train trait tramp trash tread treat trend triad trial tribe trick tried " +
+                  "tripe trite troll troop trope trout truce truck truly trump trunk truss trust truth " +
+                  "tryst tulip tumor tunic turbo tutor twang tweak tweed tweet twice twine twirl twist " +
+                  "udder ulcer ultra umbra uncle uncut under undue unfit unify union unite unity unlit " +
+                  "until unzip upper upset urban urine usage usher using usual usurp utter vague valet " +
+                  "valid valor value valve vapid vapor vault vaunt vegan venom venue verge verse verso " +
+                  "verve vicar video vigil vigor villa vinyl viola viper viral virus visit visor vista " +
+                  "vital vivid vixen vocal vodka vogue voice vomit voter vouch vowel vying wacky wafer " +
+                  "wager wagon waist waive waltz warty waste watch water waver weary weave wedge weedy " +
+                  "weigh weird welsh wench whack whale wharf wheat wheel whelp where which whiff while " +
+                  "whine whiny whirl whisk white whole whoop whose widen wider widow width wield wilds " +
+                  "willy wimpy wince winch windy wiser wispy witch witty woken woman women woody woozy " +
+                  "wordy world worry worse worst worth would wound woven wrack wrath wreak wreck wrest " +
+                  "wring wrist write wrong wrote wrung yacht yearn yeast yield young yours youth zebra zesty"
+
+              fun load(context: Context): List<String> {
+                  val fromAsset = runCatching {
+                      context.assets.open("words5.txt").bufferedReader().use { r ->
+                          r.readLines().map { it.trim().lowercase() }
+                              .filter { it.length == 5 && it.all { c -> c in 'a'..'z' } }
+                      }
+                  }.getOrNull()
+                  if (!fromAsset.isNullOrEmpty()) return fromAsset
+                  return FALLBACK.split(" ").map { it.trim().lowercase() }.filter { it.length == 5 }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/live/savvybot/SavvyA11yService.kt <<'EOF'
+          package live.savvybot
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class SavvyA11yService : AccessibilityService() {
+
+              data class Cell(val letter: Char, val bounds: Rect)
+
+              override fun onServiceConnected() { instance = this }
+              override fun onDestroy() { instance = null; super.onDestroy() }
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              private fun gameRoot(): AccessibilityNodeInfo? {
+                  val root = rootInActiveWindow ?: return null
+                  return if (root.packageName == TARGET) root
+                  else windows.firstOrNull { it.root?.packageName == TARGET }?.root
+              }
+
+              fun readCells(): List<Cell> {
+                  val root = gameRoot() ?: return emptyList()
+                  val out = ArrayList<Cell>()
+                  walk(root, out, 0)
+                  return out.sortedWith(
+                      compareBy({ it.bounds.centerY() / 40 }, { it.bounds.centerX() })
+                  )
+              }
+
+              private fun walk(node: AccessibilityNodeInfo?, out: MutableList<Cell>, depth: Int) {
+                  if (node == null || depth > 40) return
+                  val txt = (node.text ?: node.contentDescription)?.toString()?.trim()
+                  if (!txt.isNullOrEmpty() && txt.length == 1 && txt[0].isLetter()) {
+                      val r = Rect()
+                      node.getBoundsInScreen(r)
+                      if (r.width() > 12 && r.height() > 12) out.add(Cell(txt[0].lowercaseChar(), r))
+                  }
+                  for (i in 0 until node.childCount) walk(node.getChild(i), out, depth + 1)
+              }
+
+              fun tapLabel(label: String): Boolean {
+                  val root = gameRoot() ?: return false
+                  val hit = find(root, label, 0) ?: return false
+                  var n: AccessibilityNodeInfo? = hit
+                  while (n != null) {
+                      if (n.isClickable) return n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                      n = n.parent
+                  }
+                  val r = Rect().also { hit.getBoundsInScreen(it) }
+                  return tapPoint(r.centerX().toFloat(), r.centerY().toFloat())
+              }
+
+              private fun find(node: AccessibilityNodeInfo?, label: String, depth: Int): AccessibilityNodeInfo? {
+                  if (node == null || depth > 40) return null
+                  val txt = (node.text ?: node.contentDescription)?.toString()?.trim()?.lowercase()
+                  if (txt == label.lowercase()) return node
+                  for (i in 0 until node.childCount) find(node.getChild(i), label, depth + 1)?.let { return it }
+                  return null
+              }
+
+              fun tapPoint(x: Float, y: Float): Boolean {
+                  val p = Path().apply { moveTo(x, y) }
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(p, 0, 40)).build()
+                  return dispatchGesture(g, null, null)
+              }
+
+              companion object {
+                  const val TARGET = "live.playsavvy.savvy"
+                  var instance: SavvyA11yService? = null
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/live/savvybot/TileClassifier.kt <<'EOF'
+          package live.savvybot
+
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.Rect
+
+          object TileClassifier {
+              fun classify(bmp: Bitmap, cell: Rect, tolerance: Float): Char {
+                  val patch = 9
+                  var r = 0L; var g = 0L; var b = 0L; var n = 0
+                  val cx = cell.centerX(); val cy = cell.centerY()
+                  for (dx in -patch..patch) for (dy in -patch..patch) {
+                      val x = (cx + dx).coerceIn(0, bmp.width - 1)
+                      val y = (cy + dy).coerceIn(0, bmp.height - 1)
+                      val p = bmp.getPixel(x, y)
+                      r += Color.red(p); g += Color.green(p); b += Color.blue(p); n++
+                  }
+                  if (n == 0) return '?'
+                  val hsv = FloatArray(3)
+                  Color.RGBToHSV((r / n).toInt(), (g / n).toInt(), (b / n).toInt(), hsv)
+                  val hue = hsv[0]; val sat = hsv[1]; val v = hsv[2]
+                  if (v < 0.09f / tolerance) return '?'
+                  if (sat < 0.18f * tolerance) return 'x'
+                  return when {
+                      hue in 75f..175f -> 'g'
+                      hue in 20f..74f -> 'y'
+                      else -> 'x'
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/live/savvybot/Typer.kt <<'EOF'
+          package live.savvybot
+
+          import android.os.Handler
+          import android.os.Looper
+
+          object Typer {
+              private val handler = Handler(Looper.getMainLooper())
+              private val SUBMIT = listOf("enter", "submit", "guess", "send", "done")
+
+              fun type(word: String, onDone: () -> Unit = {}) {
+                  val svc = SavvyA11yService.instance ?: return
+                  var i = 0
+                  fun step() {
+                      if (i < word.length) {
+                          svc.tapLabel(word[i].toString())
+                          i++
+                          handler.postDelayed(::step, 85)
+                      } else {
+                          handler.postDelayed({
+                              SUBMIT.firstOrNull { svc.tapLabel(it) }
+                              onDone()
+                          }, 120)
+                      }
+                  }
+                  step()
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/live/savvybot/CaptureService.kt <<'EOF'
+          package live.savvybot
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.*
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import androidx.core.app.NotificationCompat
+
+          class CaptureService : Service() {
+
+              private lateinit var wm: WindowManager
+              private var projection: MediaProjection? = null
+              private var display: VirtualDisplay? = null
+              private var reader: ImageReader? = null
+              private var overlay: LinearLayout? = null
+              private lateinit var solver: SolverEngine
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var lastHash = 0
+              private var busy = false
+              private var running = false
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  solver = SolverEngine(WordRepo.load(this))
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_STOP -> { stopSelf(); return START_NOT_STICKY }
+                      ACTION_START -> {
+                          notice()
+                          val code = intent.getIntExtra("code", 0)
+                          @Suppress("DEPRECATION")
+                          val data = intent.getParcelableExtra<Intent>("data")
+                              ?: return START_NOT_STICKY
+                          val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                          projection = mgr.getMediaProjection(code, data)
+                          projection?.registerCallback(object : MediaProjection.Callback() {
+                              override fun onStop() { stopSelf() }
+                          }, handler)
+                          begin()
+                          buildOverlay()
+                          running = true
+                          handler.post(::tick)
+                      }
+                  }
+                  return START_STICKY
+              }
+
+              private fun notice() {
+                  val ch = NotificationChannel(CHANNEL, "SavvyBot", NotificationManager.IMPORTANCE_LOW)
+                  (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+                  val n = NotificationCompat.Builder(this, CHANNEL)
+                      .setContentTitle("SavvyBot running")
+                      .setSmallIcon(android.R.drawable.ic_menu_view)
+                      .setOngoing(true).build()
+                  startForeground(1, n)
+              }
+
+              private fun begin() {
+                  val m = resources.displayMetrics
+                  reader = ImageReader.newInstance(m.widthPixels, m.heightPixels, PixelFormat.RGBA_8888, 2)
+                  display = projection?.createVirtualDisplay(
+                      "savvybot", m.widthPixels, m.heightPixels, m.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, handler
+                  )
+              }
+
+              private fun grab(): Bitmap? {
+                  val img = reader?.acquireLatestImage() ?: return null
+                  return try {
+                      val plane = img.planes[0]
+                      val bmp = Bitmap.createBitmap(
+                          plane.rowStride / plane.pixelStride, img.height, Bitmap.Config.ARGB_8888
+                      )
+                      bmp.copyPixelsFromBuffer(plane.buffer)
+                      bmp
+                  } finally { img.close() }
+              }
+
+              private fun tick() {
+                  if (!running) return
+                  try { step() } catch (t: Throwable) { setStatus("error: " + t.message) }
+                  handler.postDelayed(::tick, 300)
+              }
+
+              private fun step() {
+                  if (busy) return
+                  val svc = SavvyA11yService.instance
+                  if (svc == null) { setStatus("accessibility off"); return }
+                  val cells = svc.readCells()
+                  if (cells.isEmpty()) { setStatus("no board on screen"); return }
+                  val n = detectWidth(cells)
+                  if (n < 4 || n > 7) { setStatus("grid width unclear (" + n + ")"); return }
+                  val bmp = grab() ?: return
+
+                  val rows = ArrayList<SolverEngine.Row>()
+                  cells.chunked(n).forEach { row ->
+                      val letters = row.joinToString("") { it.letter.toString() }
+                      val marks = row.map { TileClassifier.classify(bmp, it.bounds, tolerance()) }.joinToString("")
+                      if (marks.count { it == 'g' || it == 'y' || it == 'x' } >= n - 1) {
+                          rows.add(SolverEngine.Row(letters, marks))
+                      }
+                  }
+                  if (rows.isEmpty()) { setStatus("waiting for marks"); return }
+
+                  val committed = rows.filter { it.marks.any { m -> m != '?' } }
+                  val hash = committed.joinToString("|") { it.letters + it.marks }.hashCode()
+                  val res = solver.solve(committed, n, false)
+                  if (res.pool.isEmpty()) { setStatus("no fit - check board"); return }
+
+                  setStatus(res.pool.size.toString() + " left")
+                  render(res.ranked.take(5))
+                  if (autoSend() && res.ranked.isNotEmpty() && hash != lastHash && committed.size < 6) {
+                      lastHash = hash
+                      busy = true
+                      Typer.type(res.ranked.first()) { busy = false }
+                  }
+              }
+
+              private fun detectWidth(cells: List<SavvyA11yService.Cell>): Int {
+                  val y0 = cells.first().bounds.centerY()
+                  return cells.count { kotlin.math.abs(it.bounds.centerY() - y0) < 30 }
+              }
+
+              private fun buildOverlay() {
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(18, 12, 18, 14)
+                      setBackgroundColor(0xEE0D1117.toInt())
+                  }
+                  val strip = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL; id = 42
+                  }
+                  box.addView(strip)
+                  box.addView(TextView(this).apply {
+                      id = 43; setTextColor(0xFF8FA6BD.toInt()); textSize = 11f
+                  })
+                  val p = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.BOTTOM }
+                  runCatching { wm.addView(box, p) }
+                  overlay = box
+              }
+
+              private fun render(words: List<String>) {
+                  val strip = overlay?.findViewById<LinearLayout>(42) ?: return
+                  strip.removeAllViews()
+                  words.forEachIndexed { i, w ->
+                      strip.addView(TextView(this).apply {
+                          text = w.uppercase()
+                          textSize = if (i == 0) 22f else 16f
+                          setTextColor(if (i == 0) 0xFFFFFFFF.toInt() else 0xFFCFE3FF.toInt())
+                          setPadding(16, 8, 16, 8)
+                          setOnClickListener {
+                              lastHash = 0
+                              busy = true
+                              Typer.type(w) { busy = false }
+                          }
+                      })
+                  }
+              }
+
+              private fun setStatus(s: String) { overlay?.findViewById<TextView>(43)?.text = s }
+              private fun tolerance() = getSharedPreferences("bot", MODE_PRIVATE).getFloat("tol", 1f)
+              private fun autoSend() = getSharedPreferences("bot", MODE_PRIVATE).getBoolean("auto", false)
+
+              override fun onDestroy() {
+                  running = false
+                  handler.removeCallbacksAndMessages(null)
+                  overlay?.let { runCatching { wm.removeView(it) } }
+                  display?.release(); reader?.close(); projection?.stop()
+                  super.onDestroy()
+              }
+
+              override fun onBind(intent: Intent?) = null
+
+              companion object {
+                  const val CHANNEL = "savvybot"
+                  const val ACTION_START = "start"
+                  const val ACTION_STOP = "stop"
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/live/savvybot/MainActivity.kt <<'EOF'
+          package live.savvybot
+
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.Switch
+          import android.widget.TextView
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var status: TextView
+
+              private val launcher =
+                  registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                      if (r.resultCode == RESULT_OK && r.data != null) {
+                          startForegroundService(
+                              Intent(this, CaptureService::class.java).apply {
+                                  action = CaptureService.ACTION_START
+                                  putExtra("code", r.resultCode)
+                                  putExtra("data", r.data)
+                              }
+                          )
+                          status.text = "running - switch to Savvy"
+                      }
+                  }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("bot", MODE_PRIVATE)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 64, 48, 48)
+                  }
+
+                  root.addView(TextView(this).apply { text = "SavvyBot"; textSize = 26f })
+                  root.addView(TextView(this).apply {
+                      text = "Grant all three, then start. The strip appears over the game."
+                      textSize = 13f; setPadding(0, 16, 0, 32)
+                  })
+                  root.addView(Button(this).apply {
+                      text = "1. Accessibility settings"
+                      setOnClickListener {
+                          startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "2. Allow drawing over apps"
+                      setOnClickListener {
+                          startActivity(Intent(
+                              Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                              Uri.parse("package:" + packageName)
+                          ))
+                      }
+                  })
+                  root.addView(Switch(this).apply {
+                      text = "3. Auto-send guesses"
+                      isChecked = prefs.getBoolean("auto", false)
+                      setPadding(0, 32, 0, 8)
+                      setOnCheckedChangeListener { _, v -> prefs.edit().putBoolean("auto", v).apply() }
+                  })
+                  root.addView(TextView(this).apply {
+                      text = "Colour tolerance"; textSize = 12f; setPadding(0, 24, 0, 0)
+                  })
+                  root.addView(SeekBar(this).apply {
+                      max = 18
+                      progress = ((prefs.getFloat("tol", 1f) - 0.6f) * 10).toInt().coerceIn(0, 18)
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, f: Boolean) {
+                              prefs.edit().putFloat("tol", 0.6f + p / 10f).apply()
+                          }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {}
+                      })
+                  })
+                  root.addView(Button(this).apply {
+                      text = "Start solver"
+                      setPadding(0, 40, 0, 0)
+                      setOnClickListener {
+                          if (SavvyA11yService.instance == null) {
+                              status.text = "enable accessibility first"; return@setOnClickListener
+                          }
+                          if (!Settings.canDrawOverlays(this@MainActivity)) {
+                              status.text = "allow overlay first"; return@setOnClickListener
+                          }
+                          val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                          launcher.launch(mgr.createScreenCaptureIntent())
+                      }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "Stop"
+                      setOnClickListener {
+                          startService(Intent(this@MainActivity, CaptureService::class.java)
+                              .setAction(CaptureService.ACTION_STOP))
+                          status.text = "stopped"
+                      }
+                  })
+                  status = TextView(this).apply { setPadding(0, 32, 0, 0); textSize = 13f }
+                  root.addView(status)
+                  setContentView(root)
+              }
+          }
+          EOF
+
+          curl -sf https://cdn.jsdelivr.net/gh/tabatkins/wordle-list/words \
+            -o app/src/main/assets/words5.txt || echo "no wordlist, using built-in"
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: savvybot-apk
+          path: app/build/outputs/apk/debug/*.apk
